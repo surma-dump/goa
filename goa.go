@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"github.com/voxelbrain/goptions"
 	"go/ast"
 	"go/parser"
@@ -21,10 +22,18 @@ func init() {
 	protobufTemplate = template.Must(template.New("protobufTemplate").Funcs(template_funcs).Parse(PROTOBUF_TEMPLATE))
 }
 
+type TemplateData struct {
+	Id   int
+	Rule string
+	Type string
+	Name string
+}
 type ExportedFunc struct {
 	GoName       string
 	ExportedName string
 	Type         *ast.FuncType
+	Params       []TemplateData
+	Results      []TemplateData
 }
 
 func main() {
@@ -56,28 +65,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("Could not parse file: %s", err)
 		}
-		exported_funcs := []*ExportedFunc{}
-		for _, decl := range tree.Decls {
-			if f, ok := decl.(*ast.FuncDecl); ok {
-				// If there's no comment at all, there's
-				// definitely no "export" comment ;)
-				if f.Doc == nil || f.Doc.List == nil {
-					continue
-				}
-				for _, comment := range f.Doc.List {
-					stripped_comment := strings.Trim(comment.Text, "/\t ")
-					if strings.HasPrefix(stripped_comment, "goa-export") {
-						if f.Recv != nil {
-							log.Fatalf("Methods cannot be exported")
-						}
-						exported_funcs = append(exported_funcs, &ExportedFunc{
-							GoName:       f.Name.Name,
-							ExportedName: strings.TrimSpace(stripped_comment[len("goa-export"):]),
-							Type:         f.Type,
-						})
-					}
-				}
-			}
+
+		exported_funcs := exportedFunctions(tree.Decls)
+		for _, ef := range exported_funcs {
+			ef.Params = templateData(ef.Type.Params)
+			ef.Results = templateData(ef.Type.Results)
 		}
 
 		err = protobufTemplate.Execute(protobuffile, exported_funcs)
@@ -91,28 +83,85 @@ func main() {
 	}
 }
 
-const PROTOBUF_TEMPLATE = `
-{{define "rule"}} {{if isArray .Type}} repeated {{else}} required {{end}} {{end}}
-{{define "type"}} {{if isArray .Type}} {{with toArray .Type}}{{.Elt}}{{end}} {{else}} {{.Type}} {{end}} {{end}}
-{{define "parameters"}}
-	{{range $fidx, $field := .}}
-		{{range $nidx, $name := .Names}}
-			{{template "rule" $field}} {{template "type" $field}} {{$name.Name}}
-		{{else}}
-			{{template "rule" $field}} {{template "type" $field}} r_{{$fidx}}_0
-		{{end}}
-	{{end}}
-{{end}}
-{{range .}}
-
-message {{.ExportedName}}_call {
-	required int id
-	{{with .Type.Params.List}}{{template "parameters" .}}{{end}}
+func exportedFunctions(decls []ast.Decl) []*ExportedFunc {
+	ef := []*ExportedFunc{}
+	for _, decl := range decls {
+		if f, ok := decl.(*ast.FuncDecl); ok {
+			// If there's no comment at all, there's
+			// definitely no "export" comment ;)
+			if f.Doc == nil || f.Doc.List == nil {
+				continue
+			}
+			for _, comment := range f.Doc.List {
+				stripped_comment := strings.Trim(comment.Text, "/\t ")
+				if strings.HasPrefix(stripped_comment, "goa-export") {
+					if f.Recv != nil {
+						log.Fatalf("Methods cannot be exported")
+					}
+					ef = append(ef, &ExportedFunc{
+						GoName:       f.Name.Name,
+						ExportedName: strings.TrimSpace(stripped_comment[len("goa-export"):]),
+						Type:         f.Type,
+					})
+				}
+			}
+		}
+	}
+	return ef
 }
 
+func templateData(f *ast.FieldList) []TemplateData {
+	tld := []TemplateData{}
+	id := 2
+	for _, field := range f.List {
+		entry := TemplateData{
+			Type: "<unsupported>",
+			Rule: "required",
+			Name: "<anonymous>",
+		}
+		switch t := field.Type.(type) {
+		case *ast.Ident:
+			entry.Type = t.Name
+		case *ast.ArrayType:
+			entry.Type = t.Elt.(*ast.Ident).Name
+			entry.Rule = "repeated"
+		}
+		if entry.Type == "int" {
+			entry.Type = "int64"
+		}
+		if field.Names == nil {
+			// Anonymous fields (e.g. return field list)
+			entry.Id = id
+			entry.Name = fmt.Sprintf("f_%d", entry.Id)
+			tld = append(tld, entry)
+			id++
+		} else {
+			for _, name := range field.Names {
+				entry := entry //copy
+				entry.Id = id
+				entry.Name = name.Name
+				tld = append(tld, entry)
+				id++
+			}
+		}
+	}
+	return tld
+}
+
+const PROTOBUF_TEMPLATE = `
+{{define "function"}}
+	required int64 callid = 1;
+	{{range .}}
+	{{.Rule}} {{.Type}} {{.Name}} = {{.Id}};
+	{{end}}
+{{end}}
+
+{{range .}}
+message {{.ExportedName}}_call {
+	{{template "function" .Params}}
+}
 message {{.ExportedName}}_result {
-	required int id
-	{{with .Type.Results.List}}{{template "parameters" .}}{{end}}
+	{{template "function" .Results}}
 }
 {{end}}
 `
