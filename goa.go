@@ -6,11 +6,17 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"log"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"text/template"
+)
+
+const (
+	OUTPUT_FILE = "def.proto"
 )
 
 var (
@@ -19,7 +25,7 @@ var (
 )
 
 func init() {
-	protobufTemplate = template.Must(template.New("protobufTemplate").Funcs(template_funcs).Parse(PROTOBUF_TEMPLATE))
+	protobufTemplate = template.Must(template.New("protobufTemplate").Parse(PROTOBUF_TEMPLATE))
 }
 
 type TemplateData struct {
@@ -28,6 +34,7 @@ type TemplateData struct {
 	Type string
 	Name string
 }
+
 type ExportedFunc struct {
 	GoName       string
 	ExportedName string
@@ -43,9 +50,9 @@ func main() {
 		goptions.Verbs
 		Init struct {
 		} `goptions:"init"`
-		Build struct {
+		Generate struct {
 			GoFile *os.File `goptions:"-g, --go-file, description='Go file to generate stubs for', rdonly"`
-		} `goptions:"build"`
+		} `goptions:"generate"`
 	}{}
 	goptions.ParseAndFail(&options)
 	if len(options.Verbs) == 0 {
@@ -53,34 +60,53 @@ func main() {
 		return
 	}
 
-	protobuffile, err := os.Create("def.proto")
-	if err != nil {
-		log.Fatalf("Could not create output file 'def.proto': %s", err)
-	}
-
 	switch options.Verbs {
-	case "build":
-		fset := token.NewFileSet()
-		tree, err := parser.ParseFile(fset, "", options.Build.GoFile, parser.ParseComments)
+	case "generate":
+		err := generateProtobuf(options.Generate.GoFile, OUTPUT_FILE)
 		if err != nil {
-			log.Fatalf("Could not parse file: %s", err)
+			log.Fatalf("Generating ProtoBuf file failed: %s", err)
 		}
-
-		exported_funcs := exportedFunctions(tree.Decls)
-		for _, ef := range exported_funcs {
-			ef.Params = templateData(ef.Type.Params)
-			ef.Results = templateData(ef.Type.Results)
-		}
-
-		err = protobufTemplate.Execute(protobuffile, exported_funcs)
+		err = compileProtobuf(OUTPUT_FILE)
 		if err != nil {
-			log.Fatalf("Protobuf rendering failed: %s", err)
+			log.Fatalf("Generating Java/Go message stubs failed: %s", err)
 		}
-		protobuffile.Close()
-
 	default:
 		panic("Not implemented")
 	}
+}
+
+func generateProtobuf(r io.Reader, outputpath string) error {
+	protobuffile, err := os.Create(outputpath)
+	if err != nil {
+		return fmt.Errorf("Could not create output file 'def.proto': %s", err)
+	}
+	defer protobuffile.Close()
+
+	fset := token.NewFileSet()
+	tree, err := parser.ParseFile(fset, "", r, parser.ParseComments)
+	if err != nil {
+		return fmt.Errorf("Could not parse file: %s", err)
+	}
+
+	exported_funcs := exportedFunctions(tree.Decls)
+	for _, ef := range exported_funcs {
+		ef.Params = types(ef.Type.Params)
+		ef.Results = types(ef.Type.Results)
+	}
+
+	err = protobufTemplate.Execute(protobuffile, exported_funcs)
+	if err != nil {
+		fmt.Errorf("Protobuf rendering failed: %s", err)
+	}
+	return nil
+}
+
+func compileProtobuf(filepath string) error {
+	cmd := exec.Command("protoc", "--java_out=.", "--go_out=.", filepath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func exportedFunctions(decls []ast.Decl) []*ExportedFunc {
@@ -110,7 +136,7 @@ func exportedFunctions(decls []ast.Decl) []*ExportedFunc {
 	return ef
 }
 
-func templateData(f *ast.FieldList) []TemplateData {
+func types(f *ast.FieldList) []TemplateData {
 	tld := []TemplateData{}
 	id := 2
 	for _, field := range f.List {
